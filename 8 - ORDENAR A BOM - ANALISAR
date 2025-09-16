@@ -1,0 +1,483 @@
+Option Explicit On
+Imports System.Collections.Generic
+Imports Inventor
+Imports System.IO
+
+Sub Main()
+    ' Verifica documento ativo
+    If ThisApplication.ActiveDocument Is Nothing OrElse _
+       Not TypeOf ThisApplication.ActiveDocument Is AssemblyDocument Then
+        MessageBox.Show("É necessário ter um documento de montagem ativo.", "Erro")
+        Exit Sub
+    End If
+
+    Dim oDoc As AssemblyDocument = ThisApplication.ActiveDocument
+    Dim oAsmDef As AssemblyComponentDefinition = oDoc.ComponentDefinition
+    Dim oBOM As BOM = oAsmDef.BOM
+
+    ' Ativa view estruturado (se possível)
+    Try
+        oBOM.StructuredViewEnabled = True
+    Catch ex As Exception
+        MessageBox.Show("Não foi possível ativar StructuredView do BOM: " & ex.Message, "Erro")
+        Exit Sub
+    End Try
+
+    ' Tenta localizar o BOMView estruturado (tentativa de nomes comuns)
+    Dim structViewName As String = Nothing
+    Dim possibleNames() As String = {"Structured", "Estruturada", "Estruturado", "Estruturado (Todos níveis)", "Estruturado Todos Níveis"}
+    For Each vbv As BOMView In oBOM.BOMViews
+        For Each cand As String In possibleNames
+            If String.Compare(vbv.Name, cand, True) = 0 Then
+                structViewName = vbv.Name
+                Exit For
+            End If
+        Next
+        If structViewName IsNot Nothing Then Exit For
+    Next
+    If structViewName Is Nothing Then
+        ' fallback: take first view that contains "struct" (case-insensitive)
+        For Each vbv As BOMView In oBOM.BOMViews
+            If vbv.Name.ToLower().Contains("struct") Or vbv.Name.ToLower().Contains("estrut") Then
+                structViewName = vbv.Name
+                Exit For
+            End If
+        Next
+    End If
+    If structViewName Is Nothing Then
+        MessageBox.Show("Não foi possível localizar um BOMView estruturado (Structured). Verifique seus BOMViews.", "Erro")
+        Exit Sub
+    End If
+
+    ' Criar dicionário principal
+    Dim map As New Dictionary(Of String, Dictionary(Of String, String))(StringComparer.OrdinalIgnoreCase)
+
+    ' Inicia transaction para agrupamento de alterações
+    Dim txnMgr As TransactionManager = ThisApplication.TransactionManager
+    Dim txn As Transaction = txnMgr.StartTransaction(ThisApplication.ActiveDocument, "Sincronizar BOM (bottom-up)")
+
+    Try
+        ' Primeiro: construir mapeamento bottom-up
+        ProcessAssemblyForMapping(oDoc, structViewName, map)
+
+        ' Segundo: aplicar os números (top-down) — para aplicar as correções que dependem das submontagens
+        ApplyNumbersTopDown(oDoc, structViewName, map)
+
+        MessageBox.Show("Sincronização de Item Numbers concluída.", "Sucesso")
+    Catch ex As Exception
+        MessageBox.Show("Erro durante a sincronização: " & ex.Message, "Erro")
+    Finally
+        txn.End()
+    End Try
+
+End Sub
+
+' --- FUNÇÕES AUXILIARES ---
+
+' Processa uma montagem recursivamente para popular o dicionário map
+' Faz bottom-up: processa todas as submontagens primeiro, depois registra a própria montagem.
+Sub ProcessAssemblyForMapping(asmDoc As AssemblyDocument, structViewName As String, map As Dictionary(Of String, Dictionary(Of String, String)))
+    If asmDoc Is Nothing Then Exit Sub
+
+    Dim asmCompDef As AssemblyComponentDefinition = asmDoc.ComponentDefinition
+    Dim bom As BOM = asmCompDef.BOM
+
+    ' Garante structured view ativo para esta montagem
+    Try
+        bom.StructuredViewEnabled = True
+    Catch
+        ' se não conseguir ativar, ainda tentamos prosseguir
+    End Try
+
+    Dim structView As BOMView = Nothing
+    Try
+        structView = bom.BOMViews(structViewName)
+    Catch
+        ' se não encontrar a view, aborta esta montagem
+        Return
+    End Try
+
+    ' Primeiro: para cada linha com ChildRows, identificar a submontagem e processá-la recursivamente
+    For Each row As BOMRow In structView.BOMRows
+        If Row.ChildRows IsNot Nothing AndAlso Row.ComponentDefinitions.Count >= 1 Then
+            ' A primeira ComponentDefinition normalmente referencia a submontagem (ocorrência)
+            Try
+                Dim compDef As ComponentDefinition = Row.ComponentDefinitions(1)
+                If TypeOf compDef Is AssemblyComponentDefinition Then
+                    Dim subAsmDoc As Document = compDef.Document
+                    If subAsmDoc IsNot Nothing AndAlso TypeOf subAsmDoc Is AssemblyDocument Then
+                        ' Processa submontagem primeiro (recursivamente)
+                        ProcessAssemblyForMapping(CType(subAsmDoc, AssemblyDocument), structViewName, map)
+                    End If
+                End If
+            Catch
+                ' ignora erros ao acessar componentes específicos
+            End Try
+        End If
+    Next
+
+    ' Depois de processar os filhos, cria o mapeamento para esta montagem
+    Try
+        Dim dictForThisAsm As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each row As BOMRow In structView.BOMRows
+            ' Cada BOMRow pode ter 1..N ComponentDefinitions (caso de componentes comuns agrupados)
+            For i As Integer = 1 To Row.ComponentDefinitions.Count
+                Dim cd As ComponentDefinition = Row.ComponentDefinitions(i)
+                Dim doc As Document = Nothing
+                Try
+                    doc = cd.Document
+                Catch
+                    doc = Nothing
+                End Try
+
+                If doc IsNot Nothing Then
+                    Dim key As String = doc.FullDocumentName
+                    ' Se já existir, não sobrescrever — mas preferimos o ItemNumber atual do view
+                    If Not dictForThisAsm.ContainsKey(key) Then
+                        dictForThisAsm.Add(key, Row.ItemNumber)
+                    End If
+                Else
+                    ' Em alguns casos (virtual components) pode não ter Document.FullDocumentName
+                    If TypeOf cd Is VirtualComponentDefinition Then
+                        ' tenta extrair Part Number como fallback
+                        Try
+                            Dim pnum As String = cd.PropertySets("Design Tracking Properties").Item("Part Number").Value.ToString()
+                            Dim keyV As String = "Virtual:" & pnum
+                            If Not dictForThisAsm.ContainsKey(keyV) Then
+                                dictForThisAsm.Add(keyV, Row.ItemNumber)
+                            End If
+                        Catch
+                        End Try
+                    End If
+                End If
+            Next
+        Next
+
+        ' Armazena no dicionário principal com chave = assembly FullDocumentName
+        Dim asmKey As String = asmDoc.FullDocumentName
+        If Not map.ContainsKey(asmKey) Then
+            map.Add(asmKey, dictForThisAsm)
+        Else
+            ' sobrescreve (atualiza) caso já exista
+            map(asmKey) = dictForThisAsm
+        End If
+    Catch
+        ' ignore
+    End Try
+End Sub
+
+' Aplica os números (top-down) usando o mapeamento construído
+Sub ApplyNumbersTopDown(mainAsmDoc As AssemblyDocument, structViewName As String, map As Dictionary(Of String, Dictionary(Of String, String)))
+    Dim rootAsm As AssemblyDocument = mainAsmDoc
+    Dim rootBOM As BOM = rootAsm.ComponentDefinition.BOM
+    Dim rootView As BOMView = Nothing
+    Try
+        rootView = rootBOM.BOMViews(structViewName)
+    Catch
+        Return
+    End Try
+
+    Dim delimiter As String = rootBOM.StructuredViewDelimiter
+    If String.IsNullOrEmpty(delimiter) Then delimiter = "."
+
+    ' Função recursiva local (top-down) para aplicar os números
+    Dim ApplyRec As Action(Of BOMRow) = Nothing
+    ApplyRec = Sub(row As BOMRow)
+                   If row.ChildRows Is Nothing Then Return
+
+                   ' identifica se a linha corresponde a uma submontagem (first componentdefinition)
+                   Dim subAsmDocFullName As String = Nothing
+                   Try
+                       Dim cd0 As ComponentDefinition = row.ComponentDefinitions(1)
+                       If TypeOf cd0 Is AssemblyComponentDefinition Then
+                           subAsmDocFullName = cd0.Document.FullDocumentName
+                       ElseIf TypeOf cd0 Is VirtualComponentDefinition Then
+                           ' virtual: create key similar to mapping step
+                           Try
+                               Dim pnum As String = cd0.PropertySets("Design Tracking Properties").Item("Part Number").Value.ToString()
+                               subAsmDocFullName = "Virtual:" & pnum
+                           Catch
+                               subAsmDocFullName = Nothing
+                           End Try
+                       End If
+                   Catch
+                       subAsmDocFullName = Nothing
+                   End Try
+
+                   ' Se temos mapping para essa submontagem, reaplica
+                   If Not String.IsNullOrEmpty(subAsmDocFullName) AndAlso map.ContainsKey(subAsmDocFullName) Then
+                       Dim dictSub As Dictionary(Of String, String) = map(subAsmDocFullName)
+                       ' Para cada child row, tente localizar o documento e reaplicar o itemNumber
+                       For Each childRow As BOMRow In row.ChildRows
+                           ' tento identificar o doc FullDocumentName do componente da childOption Explicit On
+Imports System.Collections.Generic
+Imports Inventor
+Imports System.IO
+
+Sub Main()
+    ' Verifica documento ativo
+    If ThisApplication.ActiveDocument Is Nothing OrElse _
+       Not TypeOf ThisApplication.ActiveDocument Is AssemblyDocument Then
+        MessageBox.Show("É necessário ter um documento de montagem ativo.", "Erro")
+        Exit Sub
+    End If
+
+    Dim oDoc As AssemblyDocument = ThisApplication.ActiveDocument
+    Dim oAsmDef As AssemblyComponentDefinition = oDoc.ComponentDefinition
+    Dim oBOM As BOM = oAsmDef.BOM
+
+    ' Ativa view estruturado (se possível)
+    Try
+        oBOM.StructuredViewEnabled = True
+    Catch ex As Exception
+        MessageBox.Show("Não foi possível ativar StructuredView do BOM: " & ex.Message, "Erro")
+        Exit Sub
+    End Try
+
+    ' Tenta localizar o BOMView estruturado (tentativa de nomes comuns)
+    Dim structViewName As String = Nothing
+    Dim possibleNames() As String = {"Structured", "Estruturada", "Estruturado", "Estruturado (Todos níveis)", "Estruturado Todos Níveis"}
+    For Each vbv As BOMView In oBOM.BOMViews
+        For Each cand As String In possibleNames
+            If String.Compare(vbv.Name, cand, True) = 0 Then
+                structViewName = vbv.Name
+                Exit For
+            End If
+        Next
+        If structViewName IsNot Nothing Then Exit For
+    Next
+    If structViewName Is Nothing Then
+        ' fallback: take first view that contains "struct" (case-insensitive)
+        For Each vbv As BOMView In oBOM.BOMViews
+            If vbv.Name.ToLower().Contains("struct") Or vbv.Name.ToLower().Contains("estrut") Then
+                structViewName = vbv.Name
+                Exit For
+            End If
+        Next
+    End If
+    If structViewName Is Nothing Then
+        MessageBox.Show("Não foi possível localizar um BOMView estruturado (Structured). Verifique seus BOMViews.", "Erro")
+        Exit Sub
+    End If
+
+    ' Criar dicionário principal
+    Dim map As New Dictionary(Of String, Dictionary(Of String, String))(StringComparer.OrdinalIgnoreCase)
+
+    ' Inicia transaction para agrupamento de alterações
+    Dim txnMgr As TransactionManager = ThisApplication.TransactionManager
+    Dim txn As Transaction = txnMgr.StartTransaction(ThisApplication.ActiveDocument, "Sincronizar BOM (bottom-up)")
+
+    Try
+        ' Primeiro: construir mapeamento bottom-up
+        ProcessAssemblyForMapping(oDoc, structViewName, map)
+
+        ' Segundo: aplicar os números (top-down) — para aplicar as correções que dependem das submontagens
+        ApplyNumbersTopDown(oDoc, structViewName, map)
+
+        MessageBox.Show("Sincronização de Item Numbers concluída.", "Sucesso")
+    Catch ex As Exception
+        MessageBox.Show("Erro durante a sincronização: " & ex.Message, "Erro")
+    Finally
+        txn.End()
+    End Try
+
+End Sub
+
+' --- FUNÇÕES AUXILIARES ---
+
+' Processa uma montagem recursivamente para popular o dicionário map
+' Faz bottom-up: processa todas as submontagens primeiro, depois registra a própria montagem.
+Sub ProcessAssemblyForMapping(asmDoc As AssemblyDocument, structViewName As String, map As Dictionary(Of String, Dictionary(Of String, String)))
+    If asmDoc Is Nothing Then Exit Sub
+
+    Dim asmCompDef As AssemblyComponentDefinition = asmDoc.ComponentDefinition
+    Dim BOM As BOM = asmCompDef.BOM
+
+    ' Garante structured view ativo para esta montagem
+    Try
+        BOM.StructuredViewEnabled = True
+    Catch
+        ' se não conseguir ativar, ainda tentamos prosseguir
+    End Try
+
+    Dim structView As BOMView = Nothing
+    Try
+        structView = BOM.BOMViews(structViewName)
+    Catch
+        ' se não encontrar a view, aborta esta montagem
+        Return
+    End Try
+
+    ' Primeiro: para cada linha com ChildRows, identificar a submontagem e processá-la recursivamente
+    For Each row As BOMRow In structView.BOMRows
+        If row.ChildRows IsNot Nothing AndAlso row.ComponentDefinitions.Count >= 1 Then
+            ' A primeira ComponentDefinition normalmente referencia a submontagem (ocorrência)
+            Try
+                Dim compDef As ComponentDefinition = row.ComponentDefinitions(1)
+                If TypeOf compDef Is AssemblyComponentDefinition Then
+                    Dim subAsmDoc As Document = compDef.Document
+                    If subAsmDoc IsNot Nothing AndAlso TypeOf subAsmDoc Is AssemblyDocument Then
+                        ' Processa submontagem primeiro (recursivamente)
+                        ProcessAssemblyForMapping(CType(subAsmDoc, AssemblyDocument), structViewName, map)
+                    End If
+                End If
+            Catch
+                ' ignora erros ao acessar componentes específicos
+            End Try
+        End If
+    Next
+
+    ' Depois de processar os filhos, cria o mapeamento para esta montagem
+    Try
+        Dim dictForThisAsm As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each row As BOMRow In structView.BOMRows
+            ' Cada BOMRow pode ter 1..N ComponentDefinitions (caso de componentes comuns agrupados)
+            For i As Integer = 1 To row.ComponentDefinitions.Count
+                Dim cd As ComponentDefinition = row.ComponentDefinitions(i)
+                Dim doc As Document = Nothing
+                Try
+                    doc = cd.Document
+                Catch
+                    doc = Nothing
+                End Try
+
+                If doc IsNot Nothing Then
+                    Dim key As String = doc.FullDocumentName
+                    ' Se já existir, não sobrescrever — mas preferimos o ItemNumber atual do view
+                    If Not dictForThisAsm.ContainsKey(key) Then
+                        dictForThisAsm.Add(key, row.ItemNumber)
+                    End If
+                Else
+                    ' Em alguns casos (virtual components) pode não ter Document.FullDocumentName
+                    If TypeOf cd Is VirtualComponentDefinition Then
+                        ' tenta extrair Part Number como fallback
+                        Try
+                            Dim pnum As String = cd.PropertySets("Design Tracking Properties").Item("Part Number").Value.ToString()
+                            Dim keyV As String = "Virtual:" & pnum
+                            If Not dictForThisAsm.ContainsKey(keyV) Then
+                                dictForThisAsm.Add(keyV, row.ItemNumber)
+                            End If
+                        Catch
+                        End Try
+                    End If
+                End If
+            Next
+        Next
+
+        ' Armazena no dicionário principal com chave = assembly FullDocumentName
+        Dim asmKey As String = asmDoc.FullDocumentName
+        If Not map.ContainsKey(asmKey) Then
+            map.Add(asmKey, dictForThisAsm)
+        Else
+            ' sobrescreve (atualiza) caso já exista
+            map(asmKey) = dictForThisAsm
+        End If
+    Catch
+        ' ignore
+    End Try
+End Sub
+
+' Aplica os números (top-down) usando o mapeamento construído
+Sub ApplyNumbersTopDown(mainAsmDoc As AssemblyDocument, structViewName As String, map As Dictionary(Of String, Dictionary(Of String, String)))
+    Dim rootAsm As AssemblyDocument = mainAsmDoc
+    Dim rootBOM As BOM = rootAsm.ComponentDefinition.BOM
+    Dim rootView As BOMView = Nothing
+    Try
+        rootView = rootBOM.BOMViews(structViewName)
+    Catch
+        Return
+    End Try
+
+    Dim delimiter As String = rootBOM.StructuredViewDelimiter
+    If String.IsNullOrEmpty(delimiter) Then delimiter = "."
+
+    ' Função recursiva local (top-down) para aplicar os números
+    Dim ApplyRec As Action(Of BOMRow) = Nothing
+    ApplyRec = Sub(row As BOMRow)
+                   If row.ChildRows Is Nothing Then Return
+
+                   ' identifica se a linha corresponde a uma submontagem (first componentdefinition)
+                   Dim subAsmDocFullName As String = Nothing
+                   Try
+                       Dim cd0 As ComponentDefinition = row.ComponentDefinitions(1)
+                       If TypeOf cd0 Is AssemblyComponentDefinition Then
+                           subAsmDocFullName = cd0.Document.FullDocumentName
+                       ElseIf TypeOf cd0 Is VirtualComponentDefinition Then
+                           ' virtual: create key similar to mapping step
+                           Try
+                               Dim pnum As String = cd0.PropertySets("Design Tracking Properties").Item("Part Number").Value.ToString()
+                               subAsmDocFullName = "Virtual:" & pnum
+                           Catch
+                               subAsmDocFullName = Nothing
+                           End Try
+                       End If
+                   Catch
+                       subAsmDocFullName = Nothing
+                   End Try
+
+                   ' Se temos mapping para essa submontagem, reaplica
+                   If Not String.IsNullOrEmpty(subAsmDocFullName) AndAlso map.ContainsKey(subAsmDocFullName) Then
+                       Dim dictSub As Dictionary(Of String, String) = map(subAsmDocFullName)
+                       ' Para cada child row, tente localizar o documento e reaplicar o itemNumber
+                       For Each childRow As BOMRow In row.ChildRows
+                           ' Tento identificar o doc FullDocumentName do componente da childRow
+                           Dim applied As Boolean = False
+                           For i As Integer = 1 To childRow.ComponentDefinitions.Count
+                               Try
+                                   Dim childCD As ComponentDefinition = childRow.ComponentDefinitions(i)
+                                   Dim doc As Document = childCD.Document
+                                   If doc IsNot Nothing Then
+                                       Dim key As String = doc.FullDocumentName
+                                       If dictSub.ContainsKey(key) Then
+                                           ' Aplica o ItemNumber exato, sem prefixo do pai
+                                           childRow.ItemNumber = dictSub(key)
+                                           applied = True
+                                           Exit For
+                                       End If
+                                   ElseIf TypeOf childCD Is VirtualComponentDefinition Then
+                                       ' fallback: try virtual key
+                                       Try
+                                           Dim pnum As String = childCD.PropertySets("Design Tracking Properties").Item("Part Number").Value.ToString()
+                                           Dim vkey As String = "Virtual:" & pnum
+                                           If dictSub.ContainsKey(vkey) Then
+                                               childRow.ItemNumber = dictSub(vkey)
+                                               applied = True
+                                               Exit For
+                                           End If
+                                       Catch
+                                       End Try
+                                   End If
+                               Catch
+                                   ' continue
+                               End Try
+                           Next
+
+                           ' se não aplicou via doc full name, tenta comparar por Part Number (ultima tentativa)
+                           If Not applied Then
+                               Try
+                                   Dim partNum As String = childRow.Item("Part Number") ' só se existir coluna Item/Part Number
+                               Catch
+                                   ' ignore
+                               End Try
+                           End If
+
+                           ' Recursivamente aplica para níveis abaixo
+                           If childRow.ChildRows IsNot Nothing Then
+                               ApplyRec(childRow)
+                           End If
+                       Next
+                   Else
+                       ' Se não tem mapping, ainda assim percorre recursivamente
+                       For Each childRow As BOMRow In row.ChildRows
+                           ApplyRec(childRow)
+                       Next
+                   End If
+               End Sub
+
+    ' Aplica em cada linha raiz
+    For Each rootRow As BOMRow In rootView.BOMRows
+        ApplyRec(rootRow)
+    Next
+End Sub
