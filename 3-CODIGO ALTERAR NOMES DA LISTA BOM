@@ -1,0 +1,24 @@
+Sub Main()
+Dim oBOM As BOM
+oBOM = ThisApplication.ActiveDocument.ComponentDefinition.BOM
+Dim obomview As BOMView
+obomview = oBOM.BOMViews(2)
+obomview.Sort ("Title", True)
+obomview.renumber
+For i = 1 To obomview.BOMRows.Count
+obomview.BOMRows.Item(i).ItemNumber =  Get_Number (obomview.BOMRows.Item(i).ItemNumber )
+Next
+MessageBox.Show("Done", "BOM sorted")
+
+End Sub
+
+Function Get_Number (Number)
+ Select Case Number
+    Case 1 : Return "001"
+    Case 2 : Return "002"
+    Case 3 : Return "003"
+    Case 4 : Return "004"
+            '...
+    Case Else : Return ""
+  End Select
+End Function
