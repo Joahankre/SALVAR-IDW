@@ -1,0 +1,7 @@
+Use um Dictionary(Of String, Dictionary(Of String, String)) para guardar os números por submontagem.
+
+Vá do fundo para o topo (sub para pai).
+
+Use ComponentDefinition.BOM.BOMViews("Structured") para acessar a BOM de cada submontagem.
+
+Use .ItemNumber para ler e reaplicar os valores.
