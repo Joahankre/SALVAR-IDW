@@ -1,0 +1,148 @@
+Sub Main()
+Dim sErrMsgBadDoc As String
+sErrMsgBadDoc = "This macro requires active assembly document."
+If ThisApplication.ActiveDocument Is Nothing Then
+    MessageBox.Show(sErrMsgBadDoc)
+    Exit Sub
+End If
+
+If Not TypeOf ThisApplication.ActiveDocument Is AssemblyDocument Then
+    MessageBox.Show(sErrMsgBadDoc)
+    Exit Sub
+End If
+
+Dim oTxnMgr As TransactionManager = ThisApplication.TransactionManager
+Dim oTxn As Transaction = oTxnMgr.StartTransaction(ThisApplication.ActiveDocument, "BOM Sync")
+
+Dim oDoc As AssemblyDocument
+oDoc = ThisApplication.ActiveDocument
+Dim oBOM As BOM = oDoc.ComponentDefinition.BOM
+
+oBOM.StructuredViewEnabled = True
+oBOM.StructuredViewFirstLevelOnly = False
+oBOM.StructuredViewDelimiter = "."
+
+' Find structured view
+Dim oStructView As BOMView = oBOM.BOMViews("Structured")
+
+If oStructView Is Nothing Then
+    ' No struct view even if enabled? Probably because of LOD
+    MessageBox.Show("Cannot get structured BOM view, make sure Master LOD is active")
+	oTxn.End
+    Exit Sub
+End If
+
+' Now get rows and update item numbers for sub assemblies recursively
+Dim oRow As BOMRow
+For Each oRow In oStructView.BOMRows
+    If Not oRow.ChildRows Is Nothing Then
+        UpdateItemNumbers(oRow, oBOM.StructuredViewDelimiter)
+    End If
+Next oRow
+
+oStructView.Sort("Item")
+
+MessageBox.Show("BOM item numbers have been synced", "BOM Sync")
+oTxn.End
+End Sub
+
+Sub UpdateItemNumbers(oRow1 As BOMRow, sDelim As String)
+' assembly row expected as input
+If oRow1.ChildRows Is Nothing Then
+    Exit Sub
+End If
+
+' get sub BOM and its structured view
+Dim oBOM2 As BOM = oRow1.ComponentDefinitions(1).BOM
+If oBOM2.StructuredViewEnabled = False Then
+	Try
+		oBOM2.StructuredViewEnabled = True
+	Catch
+		'MessageBox.Show("Could not enable BOM on " & oRow1.ComponentDefinitions.Item(1).Document.PropertySets.Item("Design Tracking Properties").Item("Part Number").Value)
+		GoTo NextRow:
+	End Try
+End If
+Dim oStructView2 As BOMView = oBOM2.BOMViews("Structured")
+
+' No structured view in this sub bom? Nothing to do.
+If oStructView2 Is Nothing Then
+    Exit Sub
+End If
+
+' Now iterate sub rows and match them to rows in sub bom. Transfer item number if needed
+Dim oRow2 As BOMRow
+For Each oRow2 In oRow1.ChildRows
+	'MessageBox.Show(oRow2.ComponentDefinitions.Item(1).Document.PropertySets.Item("Design Tracking Properties").Item("Part Number").Value)
+    ' Find this row in sub bom
+    Dim oRow3 As BOMRow = FindRow(oStructView2, oRow2)
+
+    If Not oRow3 Is Nothing Then
+        If Not oRow2.ChildRows Is Nothing Then
+            ' Workaround for assembly renumbering to preserve parent numbers
+            ModifyAssemblyItemNumber(oRow2, oRow3, sDelim)
+        ElseIf TypeOf oRow2.ComponentDefinitions.Item(1) Is VirtualComponentDefinition Then
+			'MessageBox.Show(oRow2.ComponentDefinitions(1).PropertySets.Item("Design Tracking Properties").Item("Part Number").Value & vbCr & oRow3.ItemNumber)
+			Dim oItem As String' = VirtualItem(oRow3)
+			oItem = oRow3.ItemNumber
+			oRow2.ItemNumber = oItem
+		Else
+            oRow2.ItemNumber = oRow3.ItemNumber
+        End If
+    End If
+    'Recurse
+    If Not oRow2.ChildRows Is Nothing Then
+        UpdateItemNumbers(oRow2, sDelim)
+    End If
+Next oRow2
+NextRow:
+End Sub
+
+' compares two BOM rows from different BOMs if they refer to same components
+Function MatchRows(oRow1 As BOMRow, oRow2 As BOMRow) As Boolean
+If oRow1.ComponentDefinitions.Count <> oRow2.ComponentDefinitions.Count Then
+    MatchRows = False
+    Exit Function
+End If
+Dim i As Integer
+For i = 1 To oRow1.ComponentDefinitions.Count
+    If oRow1.ComponentDefinitions(i).Document.FullDocumentName <> oRow2.ComponentDefinitions(i).Document.FullDocumentName Then
+        MatchRows = False
+        Exit Function
+    End If
+Next i
+'Fix for virtual components getting all the same item number
+If TypeOf oRow1.ComponentDefinitions(1) Is VirtualComponentDefinition Then
+	If oRow1.ComponentDefinitions(1).PropertySets.Item("Design Tracking Properties").Item("Part Number") IsNot oRow2.ComponentDefinitions(1).PropertySets.Item("Design Tracking Properties").Item("Part Number")
+		MatchRows = False
+		Exit Function
+	End If
+End If
+MatchRows = True
+End Function
+
+' finds BOM row in the specified BOM view which refer to same component as input row
+' no recursion, first level search only
+Function FindRow(oBOMView2 As BOMView, oRow2 As BOMRow) As BOMRow
+Dim oRow As BOMRow
+For Each oRow In oBOMView2.BOMRows
+    If MatchRows(oRow2, oRow) Then
+        FindRow = oRow
+        Exit For
+    End If
+Next oRow
+End Function
+
+' Modyfing item numbers for assembly works differently than for parts.
+' For part, only last part of the number is modified (for example "3.4", when set to "10" will change to "3.10").
+' For assemblies, override is set which replaces everything (for example "3.4", when set to "10" will change to "10").
+' Looks like a defect in API, it should be consistent. Ideally, API should provide both ways of modifying the part number.
+' Workaround it to preserve the inherited part of the number (but it won't update when parent's number changes because of
+' override.
+Sub ModifyAssemblyItemNumber(oDestRow As BOMRow, oSrcRow As BOMRow, sDelim As String)
+' source item number is always 1st level only
+' get last part of current item number, use current delimiter
+Dim sItem As String
+sItem = oDestRow.Parent.ItemNumber
+sItem = sItem & sDelim & oSrcRow.ItemNumber
+oDestRow.ItemNumber = sItem
+End Sub
