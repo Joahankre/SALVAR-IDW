@@ -1,4 +1,5 @@
 'https://ww3.cad.de/index.php/paper/?produkt=Autodesk
+'https://ww3.cad.de/foren/ubb/Forum50/HTML/041024.shtml
 
 Sub Main()
 Dim sErrMsgBadDoc As String
