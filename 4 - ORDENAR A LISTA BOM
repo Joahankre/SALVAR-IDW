@@ -1,0 +1,17 @@
+' Set a reference to the assembly document.
+' This assumes an assembly document is active.
+Dim oDoc As AssemblyDocument
+oDoc = ThisApplication.ActiveDocument
+Dim oBOM As BOM
+oBOM = oDoc.ComponentDefinition.BOM
+Dim oBOMView As BOMView
+oBOMView = oBOM.BOMViews.Item("Parts Only")
+' Sort the BOM
+Call oBOMView.Sort("BOM Structure",True)
+' Sort the BOM with a custom field
+Call oBOMView.Sort("TYPE",True)
+'Call oBOMView.Sort("Part Number",True)
+'This is the line that I want to use, but is inconsistent.
+Call oBOMView.Sort("BOM Structure",True ,"TYPE",True ,"Part Number",True)
+'Re-Number the BOM
+Call oBOMView.Renumber(1, 1)
