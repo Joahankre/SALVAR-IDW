@@ -1,3 +1,5 @@
+'https://ww3.cad.de/index.php/paper/?produkt=Autodesk
+
 Sub Main()
 Dim sErrMsgBadDoc As String
 sErrMsgBadDoc = "This macro requires active assembly document."
