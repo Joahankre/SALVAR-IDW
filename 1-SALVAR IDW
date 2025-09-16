@@ -1,0 +1,149 @@
+' Verifica se o documento ativo é um desenho (.idw)
+If ThisApplication.ActiveDocumentType <> DocumentTypeEnum.kDrawingDocumentObject Then
+    MessageBox.Show("Abra um desenho (.idw) antes de rodar esta regra.", "Erro")
+    Return
+End If
+
+Dim oDoc As DrawingDocument = ThisApplication.ActiveDocument
+
+' Verifica se o desenho possui folhas e vistas
+If oDoc.Sheets.Count = 0 OrElse oDoc.Sheets(1).DrawingViews.Count = 0 Then
+    MessageBox.Show("O desenho não possui folhas ou vistas válidas.", "Erro")
+    Return
+End If
+
+' Conta todas as vistas do desenho
+Dim totalViews As Integer = 0
+For Each oSheet As Sheet In oDoc.Sheets
+    totalViews += oSheet.DrawingViews.Count
+Next
+
+' Etapas: salvar antes + atualizar cada vista + atualizar massa + salvar final
+Dim totalSteps As Integer = totalViews + 3
+Dim currentStep As Integer = 1
+
+' Criar barra de progresso
+Dim oProgressBar As Inventor.ProgressBar
+Dim progressTitle As String = "iLogic - Atualizando Vistas e Massa"
+Dim progressMsg As String = "Etapa "
+
+oProgressBar = ThisApplication.CreateProgressBar(False, totalSteps, progressTitle)
+oProgressBar.Message = progressMsg & currentStep & " de " & totalSteps
+oProgressBar.UpdateProgress
+
+' ===== Etapa 1: salvar documento antes de começar =====
+oDoc.Save
+currentStep += 1
+oProgressBar.Message = progressMsg & currentStep & " de " & totalSteps
+oProgressBar.UpdateProgress
+
+' ===== Etapa 2: atualizar todas as vistas para modo preciso =====
+Dim erroVistas As New List(Of String)
+
+For Each oSheet As Sheet In oDoc.Sheets
+    oSheet.Activate() ' Ativa visualmente a folha
+
+    For Each oView As DrawingView In oSheet.DrawingViews
+        Try
+            oView.IsRasterView = False
+        Catch ex As Exception
+            erroVistas.Add("Folha: " & oSheet.Name & ", Vista: " & oView.Name & " - " & ex.Message)
+        End Try
+
+        currentStep += 1
+        oProgressBar.Message = progressMsg & currentStep & " de " & totalSteps
+        oProgressBar.UpdateProgress
+    Next
+Next
+
+' ===== Etapa 3: atualizar propriedades de massa na montagem da primeira vista =====
+' ===== Etapa 3: atualizar propriedades de massa via API (compatível com .ipt e .iam) =====
+Try
+    Dim oFirstSheet As Sheet = oDoc.Sheets(1)
+    Dim oFirstView As DrawingView = oFirstSheet.DrawingViews(1)
+    Dim oRefDocDesc As DocumentDescriptor = oFirstView.ReferencedDocumentDescriptor
+
+    If oRefDocDesc IsNot Nothing AndAlso oRefDocDesc.ReferencedDocument IsNot Nothing Then
+        Dim oModelDoc As Document = oRefDocDesc.ReferencedDocument
+
+        ' Trata peças (PartDocument)
+        If TypeOf oModelDoc Is PartDocument Then
+            Dim oPartDoc As PartDocument = CType(oModelDoc, PartDocument)
+            Dim oDef As PartComponentDefinition = oPartDoc.ComponentDefinition
+
+            ' Remove sobrescrição se houver
+            If oDef.MassProperties.MassOverridden Then
+                oDef.MassProperties.MassOverridden = False
+            End If
+
+            ' ✅ Atualiza massa de peças
+            oDef.UpdatePhysicalProperties()
+
+            ' (Opcional) Atualiza iProperty
+            Dim massaReal As Double = oDef.MassProperties.Mass
+            iProperties.Value(oModelDoc.DisplayName, "Physical", "Mass") = massaReal
+
+        ' Trata montagens (AssemblyDocument)
+        ElseIf TypeOf oModelDoc Is AssemblyDocument Then
+            Dim oAsmDoc As AssemblyDocument = CType(oModelDoc, AssemblyDocument)
+            Dim oDef As AssemblyComponentDefinition = oAsmDoc.ComponentDefinition
+
+            ' Remove sobrescrição de massa (caso esteja ativa)
+            If oDef.MassProperties.MassOverridden Then
+                oDef.MassProperties.MassOverridden = False
+            End If
+
+            ' ⚠️ Assemblies não possuem .UpdatePhysicalProperties
+            ' A chamada abaixo força cálculo ao acessar a massa
+            Dim massaReal As Double = oDef.MassProperties.Mass
+
+            
+
+        Else
+            erroVistas.Add("❌ O modelo referenciado não é uma peça nem montagem válida.")
+        End If
+
+        oDoc.Update()
+    Else
+        erroVistas.Add("❌ Não foi possível acessar o modelo da primeira vista da primeira folha.")
+    End If
+
+Catch ex As Exception
+    erroVistas.Add("❌ Erro ao atualizar propriedades de massa: " & ex.Message)
+End Try
+
+
+
+
+currentStep += 1
+oProgressBar.Message = progressMsg & currentStep & " de " & totalSteps
+oProgressBar.UpdateProgress
+
+' ===== Etapa 4: atualizar data de criação =====
+Try
+    iProperties.Value("Project", "Creation Date") = Now ' ✅ Mais seguro: tipo DateTime
+Catch ex As Exception
+    erroVistas.Add("❌ Erro ao atualizar iProperty 'Creation Date': " & ex.Message)
+End Try
+
+' ===== Etapa 5: salvar documento final =====
+oDoc.Save
+currentStep += 1
+oProgressBar.Message = progressMsg & currentStep & " de " & totalSteps
+oProgressBar.UpdateProgress
+
+' ===== Finalizar barra de progresso =====
+oProgressBar.Close()
+
+' ===== Mensagem final ao usuário =====
+If erroVistas.Count > 0 Then
+    Dim erroMsg As String = "⚠ Algumas vistas ou operações não foram concluídas com sucesso:" & vbCrLf & vbCrLf
+    For Each erro In erroVistas
+        erroMsg &= erro & vbCrLf
+    Next
+    MessageBox.Show(erroMsg, "Processo Concluído com Avisos", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+Else
+    MessageBox.Show("✅ Todas as vistas foram atualizadas, massa recalculada e documento salvo com sucesso.", _
+                    "Processo Concluído", MessageBoxButtons.OK, MessageBoxIcon.Information)
+End If
+				
