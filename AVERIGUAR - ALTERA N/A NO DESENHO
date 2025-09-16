@@ -1,0 +1,19 @@
+'For several parts in drawing environment
+'update mass to avoid the "N/A" in title block
+Dim oApp As Application: oApp = ThisApplication
+Dim oDoc As DrawingDocument:  oDoc = oApp.ActiveDocument
+Dim oSheets As Sheets
+Dim oSheet As Sheet
+Dim oViews As DrawingViews
+Dim oView As DrawingView
+oSheets = oDoc.Sheets
+For Each oSheet In oSheets
+    oViews = oSheet.DrawingViews
+    For Each oView In oViews
+        modelName =  oView.ReferencedDocumentDescriptor.ReferencedDocument.DisplayName
+        iProperties.Mass(modelName) = 1 'override automatic calculation
+        iProperties.Mass(modelName) = -1 'set it back to automatic calculation
+        mass = iProperties.Mass(modelName) 'force to read the property
+    Next
+Next
+InventorVb.DocumentUpdate() 'update drawing
