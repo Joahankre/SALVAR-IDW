@@ -1,0 +1,141 @@
+' iLogic: Sincronização de Item Numbers (BOM Structured View)
+' Autor: GPT Refatoração 2025
+' Requisitos: Assembly aberto, Structured BOM habilitado
+
+' --- Imports ---
+Imports Inventor
+Imports System.Collections.Generic
+Imports System.IO
+
+Sub Main()
+    Dim doc As AssemblyDocument = TryCast(ThisApplication.ActiveDocument, AssemblyDocument)
+    If doc Is Nothing Then
+        MsgBox("Abra um documento de montagem (.iam) antes de executar.", vbCritical)
+        Exit Sub
+    End If
+
+    Dim bomViewName As String = GetStructuredBOMViewName(doc)
+    If String.IsNullOrEmpty(bomViewName) Then
+        MsgBox("Nenhuma BOM Structured View encontrada.", vbExclamation)
+        Exit Sub
+    End If
+
+    Dim map As New Dictionary(Of String, Dictionary(Of String, String))(StringComparer.OrdinalIgnoreCase)
+    Dim txn As Transaction = ThisApplication.TransactionManager.StartTransaction(doc, "Sincronizar Item Numbers")
+
+    Try
+        ' Bottom-up: constrói o mapeamento dos Item Numbers
+        BuildItemNumberMap(doc, bomViewName, map)
+
+        ' Top-down: reaplica os Item Numbers usando o mapa
+        ApplyItemNumbers(doc, bomViewName, map)
+
+        MsgBox("Sincronização de Item Numbers concluída com sucesso.", vbInformation)
+    Catch ex As Exception
+        MsgBox("Erro: " & ex.Message, vbCritical)
+    Finally
+        txn.End()
+    End Try
+End Sub
+
+' --- Retorna nome válido da Structured View ---
+Function GetStructuredBOMViewName(doc As AssemblyDocument) As String
+    Dim bom As BOM = doc.ComponentDefinition.BOM
+    Try : bom.StructuredViewEnabled = True : Catch : End Try
+
+    Dim nomesComuns = {"Structured", "Estruturada", "Estruturado", "Todos Níveis", "Structured (All Levels)"}
+    For Each view As BOMView In bom.BOMViews
+        For Each nome In nomesComuns
+            If view.Name.ToLower().Contains(nome.ToLower()) Then Return view.Name
+        Next
+    Next
+    Return Nothing
+End Function
+
+' --- Bottom-up: constrói o mapa de Item Numbers ---
+Sub BuildItemNumberMap(asmDoc As AssemblyDocument, viewName As String, map As Dictionary(Of String, Dictionary(Of String, String)))
+    Dim bomView As BOMView = GetBOMViewSafe(asmDoc, viewName)
+    If bomView Is Nothing Then Exit Sub
+
+    ' Processa submontagens primeiro
+    For Each row As BOMRow In bomView.BOMRows
+        If row.ChildRows IsNot Nothing Then
+            For Each cd As ComponentDefinition In row.ComponentDefinitions
+                If TypeOf cd Is AssemblyComponentDefinition Then
+                    BuildItemNumberMap(CType(cd.Document, AssemblyDocument), viewName, map)
+                End If
+            Next
+        End If
+    Next
+
+    ' Mapeia Item Numbers atuais
+    Dim thisMap As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+    For Each row As BOMRow In bomView.BOMRows
+        For Each cd As ComponentDefinition In row.ComponentDefinitions
+            Dim key As String = GetComponentKey(cd)
+            If Not thisMap.ContainsKey(key) Then
+                thisMap(key) = row.ItemNumber
+            End If
+        Next
+    Next
+    map(asmDoc.FullDocumentName) = thisMap
+End Sub
+
+' --- Top-down: aplica os Item Numbers do mapa ---
+Sub ApplyItemNumbers(asmDoc As AssemblyDocument, viewName As String, map As Dictionary(Of String, Dictionary(Of String, String)))
+    Dim bomView As BOMView = GetBOMViewSafe(asmDoc, viewName)
+    If bomView Is Nothing Then Exit Sub
+
+    For Each row As BOMRow In bomView.BOMRows
+        ApplyRecursively(row, map)
+    Next
+End Sub
+
+Sub ApplyRecursively(row As BOMRow, map As Dictionary(Of String, Dictionary(Of String, String)))
+    If row.ChildRows Is Nothing Then Exit Sub
+
+    Dim keyAsm As String = GetComponentKey(row.ComponentDefinitions(1))
+    If Not map.ContainsKey(keyAsm) Then
+        For Each child In row.ChildRows
+            ApplyRecursively(child, map)
+        Next
+        Exit Sub
+    End If
+
+    Dim subMap As Dictionary(Of String, String) = map(keyAsm)
+    For Each child As BOMRow In row.ChildRows
+        For Each cd As ComponentDefinition In child.ComponentDefinitions
+            Dim key As String = GetComponentKey(cd)
+            If subMap.ContainsKey(key) Then
+                child.ItemNumber = subMap(key)
+                Exit For
+            End If
+        Next
+        If child.ChildRows IsNot Nothing Then
+            ApplyRecursively(child, map)
+        End If
+    Next
+End Sub
+
+' --- Retorna a BOMView com segurança ---
+Function GetBOMViewSafe(doc As AssemblyDocument, viewName As String) As BOMView
+    Try
+        Return doc.ComponentDefinition.BOM.BOMViews(viewName)
+    Catch
+        Return Nothing
+    End Try
+End Function
+
+' --- Cria uma chave única para cada componente ---
+Function GetComponentKey(cd As ComponentDefinition) As String
+    Try
+        If TypeOf cd Is VirtualComponentDefinition Then
+            Dim pnum = cd.PropertySets("Design Tracking Properties")("Part Number").Value.ToString()
+            Return "Virtual:" & pnum
+        Else
+            Return cd.Document.FullDocumentName
+        End If
+    Catch
+        Return Guid.NewGuid().ToString()
+    End Try
+End Function
