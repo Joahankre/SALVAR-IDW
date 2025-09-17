@@ -1,0 +1,57 @@
+Sub AtualizarNumerosItem(oRowPai As BOMRow, delimitador As String)
+
+    If oRowPai.ChildRows Is Nothing Then Exit Sub
+
+    Dim oBOMSub As BOM = Nothing
+    Try
+        oBOMSub = oRowPai.ComponentDefinitions(1).BOM
+    Catch ex As Exception
+        Exit Sub
+    End Try
+
+    If Not oBOMSub.StructuredViewEnabled Then
+        Try
+            oBOMSub.StructuredViewEnabled = True
+        Catch
+            GoTo ProximaLinha
+        End Try
+    End If
+
+    Dim oStructViewSub As BOMView = Nothing
+    Try
+        oStructViewSub = oBOMSub.BOMViews("Structured")
+    Catch
+    End Try
+    If oStructViewSub Is Nothing Then Exit Sub
+
+    ' === NOVO: Ordenar e renumerar a submontagem ANTES de processar filhos ===
+    Try
+        oStructViewSub.Sort("Item", True)
+        oStructViewSub.Renumber(1, 1)
+    Catch ex As Exception
+        MessageBox.Show("Erro ao ordenar ou renumerar submontagem: " & ex.Message)
+    End Try
+
+    ' Processar todos os filhos, e recursivamente seus filhos antes de renomear
+    For Each oRowFilho As BOMRow In oRowPai.ChildRows
+
+        ' Recursivo: processa os filhos primeiro
+        If Not oRowFilho.ChildRows Is Nothing Then
+            AtualizarNumerosItem(oRowFilho, delimitador)
+        End If
+
+        ' Sincronizar número de item com a BOM da submontagem
+        Dim oRowCorrespondente As BOMRow = EncontrarLinha(oStructViewSub, oRowFilho)
+
+        If Not oRowCorrespondente Is Nothing Then
+            If TypeOf oRowFilho.ComponentDefinitions.Item(1) Is VirtualComponentDefinition Then
+                oRowFilho.ItemNumber = oRowCorrespondente.ItemNumber
+            Else
+                ' Acumula o número do pai + filho
+                DefinirNumeroItemMontagem(oRowFilho, oRowCorrespondente, delimitador)
+            End If
+        End If
+    Next
+
+ProximaLinha:
+End Sub
