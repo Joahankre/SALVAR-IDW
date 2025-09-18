@@ -1,0 +1,70 @@
+' Ignora erros durante a execução
+On Error Resume Next
+
+' Define o documento ativo como sendo uma montagem (AssemblyDocument)
+Dim oAssembly As AssemblyDocument
+oAssembly = ThisApplication.ActiveDocument
+
+' Percorre todos os componentes da montagem
+For Each oComponent As ComponentOccurrence In oAssembly.ComponentDefinition.Occurrences
+    ' Verifica se o componente é uma peça (Part)
+    If TypeOf oComponent.Definition Is PartComponentDefinition Then
+        ' Acessa o documento da peça
+        Dim oPartDoc As PartDocument
+        oPartDoc = oComponent.Definition.Document
+        
+        ' Tenta acessar o valor do parâmetro "THICKNESS"
+        Dim thicknessValue As Double
+        Dim oParameter As Parameter
+        oParameter = Nothing
+        
+        ' Verifica se o componente é de chapa metálica
+        If TypeOf oPartDoc.ComponentDefinition Is SheetMetalComponentDefinition Then
+            ' Para chapa metálica, o parâmetro pode estar na coleção de parâmetros de chapa metálica
+            On Error Resume Next ' Ignora erros caso o parâmetro não exista
+            oParameter = oPartDoc.ComponentDefinition.Parameters.Item("Thickness")
+            On Error GoTo 0 ' Restaura o comportamento padrão de erro
+        Else
+            ' Para peças padrão, tenta acessar o parâmetro "THICKNESS"
+            On Error Resume Next ' Ignora erros caso o parâmetro não exista
+            oParameter = oPartDoc.ComponentDefinition.Parameters.Item("THICKNESS")
+            On Error GoTo 0 ' Restaura o comportamento padrão de erro
+        End If
+        
+        ' Verifica se o parâmetro "THICKNESS" foi encontrado
+        If oParameter Is Nothing Then
+            ' Caso o parâmetro não exista, continua para o próximo componente
+            Continue For
+        End If
+        
+        ' Se o parâmetro foi encontrado, pega o valor
+        thicknessValue = oParameter.Value
+        
+        ' Acessa as propriedades personalizadas da peça e tenta atualizar ou criar a propriedade "THICKNESS"
+        Dim propertySet As PropertySet
+        Dim propertyName As String
+        propertyName = "THICKNESS"
+        
+        ' Acessa a coleção de propriedades personalizadas
+        On Error Resume Next ' Ignora erros caso a propriedade não exista
+        propertySet = oPartDoc.PropertySets.Item("Custom")
+        On Error GoTo 0 ' Restaura o comportamento padrão de erro
+        
+        ' Tenta atualizar a propriedade personalizada "THICKNESS"
+        If propertySet IsNot Nothing Then
+            On Error Resume Next
+            propertySet.Item(propertyName).Value = Round(thicknessValue, 1)
+            On Error GoTo 0
+            
+            ' Verifica se a propriedade não existia e foi criada
+            If Err.Number <> 0 Then
+                ' Se ocorreu erro ao atualizar, cria uma nova propriedade
+                On Error GoTo 0 ' Restaura comportamento normal de erro
+                propertySet.Add(propertyName, Round(thicknessValue, 1))
+            End If
+        End If
+    End If
+Next ' Fim do laço For Each
+
+' Salva o documento da montagem após as alterações
+ThisDoc.Save
